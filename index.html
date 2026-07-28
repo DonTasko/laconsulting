@@ -696,6 +696,7 @@ async function loadAdminDetail(nif){
       <button class="back-btn" onclick="loadAdminList()">← Todos os clientes</button>
       ${renderAlerts(alerts)}
       ${renderKpiGridFixed(r.metrics || {}, fat)}
+      ${renderSaftImporter(nif)}
       ${renderDeadlinesHeader(r)}
       ${renderSection('Prazos fiscais', renderDeadlinesAdmin(r.deadlines, nif))}
       ${renderSection('Movimentos', renderMovimentosAdmin(r.movimentos, nif))}
@@ -704,6 +705,161 @@ async function loadAdminDetail(nif){
     `;
   }catch(err){
     c.innerHTML = '<div class="empty-state">'+ err.message +'</div>';
+  }
+}
+
+/* ===================== IMPORTAÇÃO SAF-T ===================== *
+ * Lê o ficheiro no browser (DOMParser), soma os totais por mês a partir de
+ * SourceDocuments > SalesInvoices > Invoice, e só envia os totais já calculados
+ * para a sheet (nunca o XML inteiro). Notas de crédito (NC) subtraem; faturas
+ * anuladas (InvoiceStatus = A) são ignoradas. O SAF-T não distingue "serviços" de
+ * "produtos", por isso não inventamos essa divisão — só total_faturado, iva e nº faturas. */
+
+const MESES_NOMES = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro'];
+let saftPending = null;
+
+function parseSaftXML(xmlText){
+  const doc = new DOMParser().parseFromString(xmlText, 'text/xml');
+  if(doc.getElementsByTagName('parsererror').length){
+    throw new Error('Ficheiro XML inválido ou corrompido.');
+  }
+  const getText = (parent, tag) => {
+    const el = parent.getElementsByTagName(tag)[0];
+    return el ? el.textContent.trim() : '';
+  };
+
+  const header = doc.getElementsByTagName('Header')[0];
+  if(!header) throw new Error('Não encontrei a secção Header — não parece ser um SAF-T válido.');
+  const nif = getText(header, 'CompanyID');
+  const nomeEmpresa = getText(header, 'BusinessName') || getText(header, 'CompanyName');
+
+  const invoices = Array.from(doc.getElementsByTagName('Invoice'));
+  const porMes = {};
+
+  invoices.forEach(inv => {
+    const status = getText(inv, 'InvoiceStatus');
+    if(status === 'A') return; // fatura anulada, ignora
+
+    const tipo = getText(inv, 'InvoiceType');
+    const sinal = (tipo === 'NC') ? -1 : 1; // nota de crédito subtrai ao total
+
+    const dataStr = getText(inv, 'InvoiceDate'); // AAAA-MM-DD
+    const partes = dataStr.split('-');
+    if(partes.length < 2) return;
+    const ano = Number(partes[0]);
+    const mesIdx = Number(partes[1]) - 1;
+    if(isNaN(ano) || mesIdx < 0 || mesIdx > 11) return;
+    const chave = ano + '-' + mesIdx;
+
+    const totaisEl = inv.getElementsByTagName('DocumentTotals')[0];
+    const gross = totaisEl ? Number(getText(totaisEl, 'GrossTotal')) || 0 : 0;
+    const tax = totaisEl ? Number(getText(totaisEl, 'TaxPayable')) || 0 : 0;
+
+    if(!porMes[chave]) porMes[chave] = { ano, mesIdx, total:0, iva:0, count:0 };
+    porMes[chave].total += gross * sinal;
+    porMes[chave].iva += tax * sinal;
+    porMes[chave].count += sinal;
+  });
+
+  const meses = Object.values(porMes)
+    .map(m => ({
+      ano: m.ano,
+      mes: MESES_NOMES[m.mesIdx],
+      total_faturado: Math.round(m.total * 100) / 100,
+      iva_liquidado: Math.round(m.iva * 100) / 100,
+      numero_faturas: m.count
+    }))
+    .sort((a,b) => (a.ano*12 + MESES_PT_FULL[a.mes.toLowerCase()]) - (b.ano*12 + MESES_PT_FULL[b.mes.toLowerCase()]));
+
+  return { nif, nomeEmpresa, meses };
+}
+
+function renderSaftImporter(nifPrefill){
+  return `
+    <section class="block">
+      <div class="block-title">Importar SAF-T</div>
+      <div class="list-item" style="flex-direction:column; align-items:stretch; gap:10px;">
+        <div class="li-sub">Carrega o ficheiro SAF-T de faturação (.xml). Os totais são somados por mês e gravados em VendasMensais.</div>
+        <input type="file" id="saft-file-input" accept=".xml" style="color:var(--text-dim); font-size:12px;">
+        <input type="hidden" id="saft-nif-prefill" value="${nifPrefill || ''}">
+        <button class="btn-primary" style="margin-top:0;" onclick="handleSaftFile()">Analisar ficheiro</button>
+      </div>
+      <div id="saft-preview"></div>
+    </section>
+  `;
+}
+
+async function handleSaftFile(){
+  const input = document.getElementById('saft-file-input');
+  const preview = document.getElementById('saft-preview');
+  if(!input.files.length){ preview.innerHTML = '<div class="empty-state">Escolhe um ficheiro .xml primeiro.</div>'; return; }
+
+  preview.innerHTML = '<div class="loading">A analisar ficheiro…</div>';
+  const file = input.files[0];
+
+  let parsed;
+  try{
+    const text = await file.text();
+    parsed = parseSaftXML(text);
+  }catch(err){
+    preview.innerHTML = '<div class="empty-state">Não consegui ler este ficheiro: ' + err.message + '</div>';
+    return;
+  }
+
+  if(!parsed.meses.length){
+    preview.innerHTML = '<div class="empty-state">Não encontrei faturas válidas neste ficheiro.</div>';
+    return;
+  }
+
+  const nifPrefillEl = document.getElementById('saft-nif-prefill');
+  const nifDestino = (nifPrefillEl && nifPrefillEl.value) ? nifPrefillEl.value : parsed.nif;
+
+  saftPending = { nif: nifDestino, nomeEmpresa: parsed.nomeEmpresa, meses: parsed.meses };
+
+  const rows = parsed.meses.map(m => `
+    <div class="list-item">
+      <div class="li-main">
+        <div class="li-title">${m.mes}/${m.ano}</div>
+        <div class="li-sub">${m.numero_faturas} fatura(s) · IVA ${fmtEUR(m.iva_liquidado)}</div>
+      </div>
+      <div class="li-title">${fmtEUR(m.total_faturado)}</div>
+    </div>
+  `).join('');
+
+  const avisoNif = nifDestino !== parsed.nif
+    ? `<div class="li-sub" style="color:var(--amber); margin-bottom:8px;">Atenção: o ficheiro é da empresa NIF ${parsed.nif}, mas vai ser gravado no cliente NIF ${nifDestino} que tens aberto.</div>`
+    : '';
+
+  preview.innerHTML = `
+    ${avisoNif}
+    ${rows}
+    <button class="btn-primary" onclick="confirmSaftImport()">Guardar ${parsed.meses.length} mês(es) na sheet</button>
+  `;
+}
+
+async function confirmSaftImport(){
+  if(!saftPending) return;
+  const preview = document.getElementById('saft-preview');
+  preview.innerHTML = '<div class="loading">A gravar na sheet…</div>';
+  try{
+    for(const m of saftPending.meses){
+      const r = await apiCall({
+        action:'importSaftMonth',
+        password: session.adminPassword,
+        nif: saftPending.nif,
+        nome_cliente: saftPending.nomeEmpresa,
+        ano: m.ano,
+        mes: m.mes,
+        total_faturado: m.total_faturado,
+        iva_liquidado: m.iva_liquidado,
+        numero_faturas: m.numero_faturas
+      });
+      if(!r.success) throw new Error(r.error || 'Erro desconhecido');
+    }
+    preview.innerHTML = '<div class="empty-state">Importado com sucesso. Reabre o cliente para veres os valores atualizados.</div>';
+    saftPending = null;
+  }catch(err){
+    preview.innerHTML = '<div class="empty-state">Erro ao gravar: ' + err.message + '</div>';
   }
 }
 
