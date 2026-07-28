@@ -334,14 +334,15 @@ function deltaArrow(dir){
 
 function renderClientDashboard(data){
   const m = data.metrics || {};
-  const runwayMeses = estimateRunway(m); // heurística simples, ver função abaixo
+  const fat = computeFaturacaoSummary(data.vendas);
+  const runwayMeses = estimateRunway(m, fat); // heurística simples, ver função abaixo
   const gauge = renderGauge(runwayMeses);
 
   const alerts = computeAlerts(data.deadlines, data.movimentos, runwayMeses);
 
   return `
     ${renderAlerts(alerts)}
-    ${renderKpiGridFixed(m)}
+    ${renderKpiGridFixed(m, fat)}
     ${gauge}
     ${renderSection('Prazos fiscais', renderDeadlinesHeader(data) + renderDeadlines(data.deadlines))}
     ${renderSection('Movimentos recentes', renderMovimentos(data.movimentos))}
@@ -350,14 +351,51 @@ function renderClientDashboard(data){
   `;
 }
 
+const MESES_PT_FULL = {
+  janeiro:0, fevereiro:1, março:2, marco:2, abril:3, maio:4, junho:5,
+  julho:6, agosto:7, setembro:8, outubro:9, novembro:10, dezembro:11
+};
+
+// Soma real da faturação a partir da tab VendasMensais (não confia em valores soltos na Metrics,
+// que são fáceis de ficar desatualizados). Faturação = soma do ano corrente; se não houver dados
+// do ano corrente, soma tudo o que existir. A variação é calculada entre os dois últimos meses reais.
+function computeFaturacaoSummary(vendas){
+  if(!vendas || !vendas.length) return { total:null, deltaLabel:'', dir:'flat' };
+
+  const anoAtual = new Date().getFullYear();
+  const doAno = vendas.filter(v => Number(v.ano) === anoAtual);
+  const base = doAno.length ? doAno : vendas;
+  const total = base.reduce((s, v) => s + (Number(v.total_faturado) || 0), 0);
+
+  const ordenado = vendas.slice().sort((a, b) => {
+    const chaveA = Number(a.ano) * 12 + (MESES_PT_FULL[String(a.mes).toLowerCase()] ?? 0);
+    const chaveB = Number(b.ano) * 12 + (MESES_PT_FULL[String(b.mes).toLowerCase()] ?? 0);
+    return chaveA - chaveB;
+  });
+
+  let deltaLabel = '', dir = 'flat';
+  if(ordenado.length >= 2){
+    const ultimo = Number(ordenado[ordenado.length - 1].total_faturado) || 0;
+    const anterior = Number(ordenado[ordenado.length - 2].total_faturado) || 0;
+    if(anterior > 0){
+      const pct = Math.round(((ultimo - anterior) / anterior) * 1000) / 10;
+      dir = pct > 0 ? 'up' : (pct < 0 ? 'down' : 'flat');
+      deltaLabel = `${pct > 0 ? '+' : ''}${pct}% vs mês anterior`;
+    }
+  }
+
+  return { total, deltaLabel, dir, ultimoMes: ordenado.length ? Number(ordenado[ordenado.length-1].total_faturado)||0 : null };
+}
+
 // KPI grid corrigido (a versão acima tinha um placeholder — esta é a que efetivamente conta)
-function renderKpiGridFixed(m){
+function renderKpiGridFixed(m, fat){
+  fat = fat || { total:null, deltaLabel:'', dir:'flat' };
   return `
     <div class="kpi-grid" style="margin-top:-20px;">
       <div class="kpi-card">
-        <div class="kpi-label">Faturação</div>
-        <div class="kpi-value">${m.faturacao_delta !== undefined ? fmtEUR(m.faturacao_delta) : '—'}</div>
-        <div class="kpi-delta ${deltaClass(m.faturacao_dir)}">${deltaArrow(m.faturacao_dir)}${m.faturacao_delta_label || ''}</div>
+        <div class="kpi-label">Faturação (soma real)</div>
+        <div class="kpi-value">${fat.total !== null ? fmtEUR(fat.total) : '—'}</div>
+        <div class="kpi-delta ${deltaClass(fat.dir)}">${deltaArrow(fat.dir)}${fat.deltaLabel}</div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label">Margem</div>
@@ -377,13 +415,13 @@ function renderKpiGridFixed(m){
   `;
 }
 
-// Heurística simples para meses de fôlego: saldo_atual / (faturacao_delta em falta de custos reais).
+// Heurística simples para meses de fôlego: saldo_atual / (faturação real do último mês * 0.6 como proxy de custos).
 // Isto é um placeholder honesto: sem uma coluna explícita de "custos_mensais" na sheet, não dá para
-// calcular um runway rigoroso. Assumi aqui uma taxa de queima = 60% da faturação do mês como proxy.
+// calcular um runway rigoroso.
 // AVISO PARA O LUIS: substitui isto por um cálculo real assim que tiveres custos mensais na Metrics.
-function estimateRunway(m){
+function estimateRunway(m, fat){
   const saldo = Number(m.saldo_atual);
-  const faturacao = Number(m.faturacao_delta);
+  const faturacao = fat && fat.ultimoMes !== null ? fat.ultimoMes : NaN;
   if(isNaN(saldo) || isNaN(faturacao) || faturacao <= 0) return null;
   const queimaEstimada = faturacao * 0.6;
   if(queimaEstimada <= 0) return null;
@@ -636,7 +674,7 @@ function renderAdminList(clients){
     <div class="list-item admin-list-item" onclick="loadAdminDetail('${c.nif}')">
       <div class="li-main">
         <div class="li-title">${c.nome_empresa || c.nif}</div>
-        <div class="li-sub">NIF ${c.nif} · ${fmtEUR(c.faturacao_dir)}</div>
+        <div class="li-sub">NIF ${c.nif} · ${fmtEUR(c.faturacao_total)}</div>
       </div>
       ${c.obrigacoes_pendentes ? `<span class="badge pendente">${c.obrigacoes_pendentes} pendente(s)</span>` : `<span class="badge pago">em dia</span>`}
     </div>
@@ -651,12 +689,13 @@ async function loadAdminDetail(nif){
     const r = await apiCall({ action:'adminClientDetail', password: session.adminPassword, nif });
     if(!r.success){ c.innerHTML = '<div class="empty-state">'+ (r.error||'Erro.') +'</div>'; return; }
     document.getElementById('topbar-company').textContent = r.empresa || nif;
-    const runwayMeses = estimateRunway(r.metrics || {});
+    const fat = computeFaturacaoSummary(r.vendas);
+    const runwayMeses = estimateRunway(r.metrics || {}, fat);
     const alerts = computeAlerts(r.deadlines, r.movimentos, runwayMeses);
     c.innerHTML = `
       <button class="back-btn" onclick="loadAdminList()">← Todos os clientes</button>
       ${renderAlerts(alerts)}
-      ${renderKpiGridFixed(r.metrics || {})}
+      ${renderKpiGridFixed(r.metrics || {}, fat)}
       ${renderDeadlinesHeader(r)}
       ${renderSection('Prazos fiscais', renderDeadlinesAdmin(r.deadlines, nif))}
       ${renderSection('Movimentos', renderMovimentosAdmin(r.movimentos, nif))}
