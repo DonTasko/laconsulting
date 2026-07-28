@@ -337,10 +337,13 @@ function renderClientDashboard(data){
   const runwayMeses = estimateRunway(m); // heurística simples, ver função abaixo
   const gauge = renderGauge(runwayMeses);
 
+  const alerts = computeAlerts(data.deadlines, data.movimentos, runwayMeses);
+
   return `
+    ${renderAlerts(alerts)}
     ${renderKpiGridFixed(m)}
     ${gauge}
-    ${renderSection('Prazos fiscais', renderDeadlines(data.deadlines))}
+    ${renderSection('Prazos fiscais', renderDeadlinesHeader(data) + renderDeadlines(data.deadlines))}
     ${renderSection('Movimentos recentes', renderMovimentos(data.movimentos))}
     ${renderSection('Vendas mensais', renderVendas(data.vendas))}
     ${renderSection('Comparação com o setor', renderBenchmark(data.benchmark))}
@@ -385,6 +388,129 @@ function estimateRunway(m){
   const queimaEstimada = faturacao * 0.6;
   if(queimaEstimada <= 0) return null;
   return Math.round((saldo / queimaEstimada) * 10) / 10;
+}
+
+/* ---------------- Alertas de tesouraria ----------------
+   NOTA: os prazos fiscais vêm sempre da sheet (tab Deadlines), nunca inventados aqui.
+   Isto só calcula "quantos dias faltam" a partir da data que o CC lá colocou. */
+
+const MESES_PT = {jan:0, fev:1, mar:2, abr:3, mai:4, jun:5, jul:6, ago:7, set:8, out:9, nov:10, dez:11};
+
+// Tenta interpretar "2026-08-20" (ISO, fiável) ou "20 ago." (sem ano, frágil — assume ano corrente,
+// e se isso resultar numa data já muito passada, assume o ano seguinte).
+function parseDeadlineDate(str){
+  if(!str) return null;
+  const s = String(str).trim();
+
+  const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if(iso) return new Date(+iso[1], +iso[2]-1, +iso[3]);
+
+  const ptShort = s.toLowerCase().match(/(\d{1,2})\s*([a-zç]{3,4})/);
+  if(ptShort){
+    const dia = +ptShort[1];
+    const mesKey = ptShort[2].slice(0,3);
+    const mes = MESES_PT[mesKey];
+    if(mes === undefined) return null;
+    const hoje = new Date();
+    let ano = hoje.getFullYear();
+    let d = new Date(ano, mes, dia);
+    const diffDias = (d - hoje) / 86400000;
+    if(diffDias < -180) d = new Date(ano + 1, mes, dia); // provavelmente já é do próximo ano
+    return d;
+  }
+  return null;
+}
+
+function computeAlerts(deadlines, movimentos, runwayMeses){
+  const alerts = [];
+  const hoje = new Date(); hoje.setHours(0,0,0,0);
+
+  (deadlines || []).forEach(d => {
+    const estado = String(d.estado || '').toLowerCase();
+    if(estado === 'pago') return;
+    const data = parseDeadlineDate(d.data);
+    const nome = d.tipo || d.descricao || 'Obrigação fiscal';
+    if(!data){
+      return; // data ilegível — não geramos alerta para não arriscar um falso aviso
+    }
+    const dias = Math.round((data - hoje) / 86400000);
+    if(dias < 0){
+      alerts.push({ level:'critico', text: `${nome} — prazo terminou há ${Math.abs(dias)} dia(s).` });
+    } else if(dias <= 7){
+      alerts.push({ level:'atencao', text: `${nome} — vence em ${dias === 0 ? 'hoje' : dias + ' dia(s)'}.` });
+    }
+  });
+
+  (movimentos || []).forEach(m => {
+    const estado = String(m.estado || '').toLowerCase();
+    if(m.tipo === 'venda' && estado === 'pendente'){
+      const data = parseDeadlineDate(m.data);
+      if(data){
+        const dias = Math.round((hoje - data) / 86400000);
+        if(dias > 30){
+          alerts.push({ level:'atencao', text: `Fatura "${m.descricao || 'venda'}" (${fmtEUR(m.valor)}) pendente há ${dias} dias.` });
+        }
+      }
+    }
+  });
+
+  if(runwayMeses !== null && runwayMeses < 2){
+    alerts.push({ level:'critico', text: `Fôlego de tesouraria estimado abaixo de 2 meses (${runwayMeses}).` });
+  }
+
+  return alerts;
+}
+
+function renderAlerts(alerts){
+  if(!alerts || !alerts.length) return '';
+  const items = alerts.map(a => `
+    <div class="list-item" style="border-left:3px solid ${a.level==='critico' ? '#C0503D' : '#C98A34'};">
+      <div class="li-main"><div class="li-title">${a.text}</div></div>
+      <span class="badge ${a.level==='critico' ? 'atrasado' : 'pendente'}">${a.level==='critico' ? 'urgente' : 'atenção'}</span>
+    </div>
+  `).join('');
+  return `<section class="block"><div class="block-title">Alertas</div>${items}</section>`;
+}
+
+/* ---------------- Exportação iCal ---------------- */
+function renderDeadlinesHeader(data){
+  if(!data.deadlines || !data.deadlines.length) return '';
+  return `<button class="back-btn" style="margin-bottom:10px;" onclick='exportDeadlinesICS(${JSON.stringify(data.deadlines)}, ${JSON.stringify(data.empresa||"")})'>⤓ Exportar para o calendário (.ics)</button>`;
+}
+
+function exportDeadlinesICS(deadlines, empresa){
+  const withDates = deadlines
+    .filter(d => String(d.estado||'').toLowerCase() !== 'pago')
+    .map(d => ({ nome: d.tipo || d.descricao || 'Obrigação fiscal', data: parseDeadlineDate(d.data) }))
+    .filter(d => d.data);
+
+  if(!withDates.length){
+    alert('Não há prazos com data reconhecível para exportar. Verifica o formato das datas na sheet (recomendado: AAAA-MM-DD).');
+    return;
+  }
+
+  const pad = n => String(n).padStart(2,'0');
+  const dt = d => `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}`;
+
+  let ics = 'BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//LAConsulting//Prazos Fiscais//PT\r\n';
+  withDates.forEach((d, i) => {
+    ics += 'BEGIN:VEVENT\r\n';
+    ics += `UID:laconsulting-${dt(d.data)}-${i}@laconsulting\r\n`;
+    ics += `DTSTART;VALUE=DATE:${dt(d.data)}\r\n`;
+    ics += `SUMMARY:${(empresa ? empresa + ' — ' : '') + d.nome}\r\n`;
+    ics += 'END:VEVENT\r\n';
+  });
+  ics += 'END:VCALENDAR\r\n';
+
+  const blob = new Blob([ics], { type:'text/calendar;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'prazos-fiscais.ics';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 function renderGauge(meses){
@@ -525,9 +651,13 @@ async function loadAdminDetail(nif){
     const r = await apiCall({ action:'adminClientDetail', password: session.adminPassword, nif });
     if(!r.success){ c.innerHTML = '<div class="empty-state">'+ (r.error||'Erro.') +'</div>'; return; }
     document.getElementById('topbar-company').textContent = r.empresa || nif;
+    const runwayMeses = estimateRunway(r.metrics || {});
+    const alerts = computeAlerts(r.deadlines, r.movimentos, runwayMeses);
     c.innerHTML = `
       <button class="back-btn" onclick="loadAdminList()">← Todos os clientes</button>
+      ${renderAlerts(alerts)}
       ${renderKpiGridFixed(r.metrics || {})}
+      ${renderDeadlinesHeader(r)}
       ${renderSection('Prazos fiscais', renderDeadlinesAdmin(r.deadlines, nif))}
       ${renderSection('Movimentos', renderMovimentosAdmin(r.movimentos, nif))}
       ${renderSection('Vendas mensais', renderVendas(r.vendas))}
