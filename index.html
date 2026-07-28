@@ -257,6 +257,18 @@ async function apiCall(params){
   return res.json();
 }
 
+// Para payloads grandes (ex: imagens em base64) que não cabem numa query string.
+// Sem cabeçalhos customizados de propósito: assim o pedido conta como "simples" e evita
+// problemas de CORS/preflight com o Web App do Apps Script.
+async function apiCallPost(bodyObj){
+  if(API_URL.indexOf('COLA_AQUI') !== -1){
+    throw new Error('Ainda não configuraste o API_URL no topo do <script>.');
+  }
+  const res = await fetch(API_URL, { method:'POST', body: JSON.stringify(bodyObj) });
+  if(!res.ok) throw new Error('Falha de rede (' + res.status + ')');
+  return res.json();
+}
+
 /* ---------------- login cliente ---------------- */
 async function doClientLogin(){
   hideError();
@@ -344,6 +356,7 @@ function renderClientDashboard(data){
     ${renderAlerts(alerts)}
     ${renderKpiGridFixed(m, fat)}
     ${gauge}
+    ${renderOcrUploader()}
     ${renderSection('Prazos fiscais', renderDeadlinesHeader(data) + renderDeadlines(data.deadlines))}
     ${renderSection('Movimentos recentes', renderMovimentos(data.movimentos))}
     ${renderSection('Vendas mensais', renderVendas(data.vendas))}
@@ -588,6 +601,173 @@ function renderGauge(meses){
 
 function renderSection(title, innerHtml){
   return `<section class="block"><div class="block-title">${title}</div>${innerHtml}</section>`;
+}
+
+/* ===================== OCR de faturas ===================== *
+ * O cliente tira/carrega uma foto (ou PDF) de uma fatura de compra. A imagem é redimensionada
+ * no browser para não ir pesada, enviada ao backend para leitura pela Gemini, e o resultado
+ * aparece num formulário EDITÁVEL — o cliente confirma/corrige antes de qualquer coisa ser
+ * gravada em ItensComprados. Nunca gravamos automaticamente o que o OCR "leu". */
+
+let ocrExtraido = null;
+let ocrEmProgresso = false;
+
+function renderOcrUploader(){
+  return `
+    <section class="block">
+      <div class="block-title">Enviar fatura (leitura automática)</div>
+      <div class="list-item" style="flex-direction:column; align-items:stretch; gap:10px;">
+        <div class="li-sub">Tira uma foto ou carrega um PDF de uma fatura de compra. A app tenta ler o fornecedor, o valor e o IVA — depois mostra-te os dados para confirmares.</div>
+        <input type="file" id="ocr-file-input" accept="image/*,.pdf" style="color:var(--text-dim); font-size:12px;">
+        <button class="btn-primary" style="margin-top:0;" onclick="handleOcrFile()">Ler fatura</button>
+      </div>
+      <div id="ocr-result"></div>
+    </section>
+  `;
+}
+
+// Redimensiona a imagem no browser (máx. 1600px no lado maior, JPEG 82%) antes de enviar,
+// para o pedido ficar mais leve e a leitura mais rápida. PDFs seguem sem alteração.
+function resizeImageFile(file){
+  return new Promise((resolve, reject) => {
+    if(file.type === 'application/pdf'){
+      const reader = new FileReader();
+      reader.onload = () => resolve({ base64: reader.result.split(',')[1], mimeType: 'application/pdf' });
+      reader.onerror = () => reject(new Error('Não consegui ler o ficheiro.'));
+      reader.readAsDataURL(file);
+      return;
+    }
+    const img = new Image();
+    const reader = new FileReader();
+    reader.onload = () => {
+      img.onload = () => {
+        const maxLado = 1600;
+        let { width, height } = img;
+        if(width > maxLado || height > maxLado){
+          const escala = maxLado / Math.max(width, height);
+          width = Math.round(width * escala);
+          height = Math.round(height * escala);
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width; canvas.height = height;
+        canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.82);
+        resolve({ base64: dataUrl.split(',')[1], mimeType: 'image/jpeg' });
+      };
+      img.onerror = () => reject(new Error('Não consegui abrir esta imagem.'));
+      img.src = reader.result;
+    };
+    reader.onerror = () => reject(new Error('Não consegui ler o ficheiro.'));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function handleOcrFile(){
+  if(ocrEmProgresso) return;
+  const input = document.getElementById('ocr-file-input');
+  const result = document.getElementById('ocr-result');
+  if(!input.files.length){ result.innerHTML = '<div class="empty-state">Escolhe uma foto ou PDF primeiro.</div>'; return; }
+
+  ocrEmProgresso = true;
+  result.innerHTML = '<div class="loading">A ler a fatura…</div>';
+  try{
+    const { base64, mimeType } = await resizeImageFile(input.files[0]);
+    const r = await apiCallPost({
+      action: 'ocrInvoice',
+      nif: session.nif,
+      token: session.token,
+      image_base64: base64,
+      mime_type: mimeType
+    });
+    if(!r.success){ result.innerHTML = '<div class="empty-state">'+ (r.error || 'Não consegui ler esta fatura.') +'</div>'; return; }
+    ocrExtraido = r.dados;
+    result.innerHTML = renderOcrReviewForm(r.dados);
+  }catch(err){
+    result.innerHTML = '<div class="empty-state">'+ err.message +'</div>';
+  }finally{
+    ocrEmProgresso = false;
+  }
+}
+
+function renderOcrReviewForm(dados){
+  const itens = (dados.itens && dados.itens.length) ? dados.itens : [{
+    descricao: dados.categoria || 'Compra',
+    quantidade: 1,
+    valor_unitario: dados.valor_total || 0,
+    valor_total: dados.valor_total || 0
+  }];
+
+  const camposComuns = `
+    <div class="li-sub" style="margin-bottom:8px; color:var(--amber);">Confirma ou corrige os dados antes de gravar — a leitura automática pode errar, sobretudo em números.</div>
+    <div class="field"><label>NIF do fornecedor</label><input id="ocr-f-nif" value="${dados.fornecedor_nif || ''}"></div>
+    <div class="field"><label>Nome do fornecedor</label><input id="ocr-f-nome" value="${dados.fornecedor_nome || ''}"></div>
+    <div class="field"><label>Nº da fatura</label><input id="ocr-f-numero" value="${dados.numero_fatura || ''}"></div>
+    <div class="field"><label>Data da compra (AAAA-MM-DD)</label><input id="ocr-f-data" value="${dados.data_compra || ''}"></div>
+    <div class="field"><label>Taxa de IVA (%)</label><input id="ocr-f-iva" value="${dados.taxa_iva ?? ''}" inputmode="decimal"></div>
+    <div class="field"><label>Categoria</label><input id="ocr-f-categoria" value="${dados.categoria || ''}"></div>
+  `;
+
+  const linhasItens = itens.map((it, i) => `
+    <div class="list-item" style="flex-direction:column; align-items:stretch; gap:6px;">
+      <input class="ocr-item-desc" data-i="${i}" value="${(it.descricao||'').replace(/"/g,'&quot;')}" placeholder="Descrição">
+      <div style="display:flex; gap:8px;">
+        <input class="ocr-item-qtd" data-i="${i}" value="${it.quantidade ?? 1}" placeholder="Qtd" style="width:70px; padding:8px; background:var(--ink); border:1px solid var(--line); border-radius:8px; color:var(--text); font-family:var(--font-mono);">
+        <input class="ocr-item-unit" data-i="${i}" value="${it.valor_unitario ?? ''}" placeholder="Valor unit." style="flex:1; padding:8px; background:var(--ink); border:1px solid var(--line); border-radius:8px; color:var(--text); font-family:var(--font-mono);">
+        <input class="ocr-item-total" data-i="${i}" value="${it.valor_total ?? ''}" placeholder="Total" style="flex:1; padding:8px; background:var(--ink); border:1px solid var(--line); border-radius:8px; color:var(--text); font-family:var(--font-mono);">
+      </div>
+    </div>
+  `).join('');
+
+  return `
+    ${camposComuns}
+    <div class="block-title" style="font-size:14px; margin-top:16px;">Itens</div>
+    ${linhasItens}
+    <button class="btn-primary" onclick="confirmOcrSave()">Guardar fatura</button>
+  `;
+}
+
+async function confirmOcrSave(){
+  if(!ocrExtraido || ocrEmProgresso) return;
+  ocrEmProgresso = true;
+  const result = document.getElementById('ocr-result');
+
+  const fornecedor_nif = document.getElementById('ocr-f-nif').value.trim();
+  const fornecedor_nome = document.getElementById('ocr-f-nome').value.trim();
+  const numero_fatura = document.getElementById('ocr-f-numero').value.trim();
+  const data_compra = document.getElementById('ocr-f-data').value.trim();
+  const taxa_iva = document.getElementById('ocr-f-iva').value.trim();
+  const categoria = document.getElementById('ocr-f-categoria').value.trim();
+
+  const descs = Array.from(document.querySelectorAll('.ocr-item-desc'));
+  const itens = descs.map(el => {
+    const i = el.dataset.i;
+    const qtd = document.querySelector(`.ocr-item-qtd[data-i="${i}"]`).value;
+    const unit = document.querySelector(`.ocr-item-unit[data-i="${i}"]`).value;
+    const total = document.querySelector(`.ocr-item-total[data-i="${i}"]`).value;
+    return {
+      fornecedor_nif, fornecedor_nome, numero_fatura, data_compra,
+      descricao: el.value.trim(), tipo: '',
+      quantidade: qtd, valor_unitario: unit, valor_total: total,
+      taxa_iva, categoria
+    };
+  });
+
+  result.innerHTML = '<div class="loading">A gravar…</div>';
+  try{
+    const r = await apiCallPost({
+      action: 'saveItemComprado',
+      nif: session.nif,
+      token: session.token,
+      itens: JSON.stringify(itens)
+    });
+    if(!r.success) throw new Error(r.error || 'Erro desconhecido');
+    result.innerHTML = '<div class="empty-state">Fatura gravada com sucesso.</div>';
+    ocrExtraido = null;
+  }catch(err){
+    result.innerHTML = '<div class="empty-state">Erro ao gravar: ' + err.message + '</div>';
+  }finally{
+    ocrEmProgresso = false;
+  }
 }
 
 function renderDeadlines(deadlines){
@@ -837,8 +1017,11 @@ async function handleSaftFile(){
   `;
 }
 
+let saftImportEmProgresso = false;
+
 async function confirmSaftImport(){
-  if(!saftPending) return;
+  if(!saftPending || saftImportEmProgresso) return;
+  saftImportEmProgresso = true;
   const preview = document.getElementById('saft-preview');
   preview.innerHTML = '<div class="loading">A gravar na sheet…</div>';
   try{
@@ -860,6 +1043,8 @@ async function confirmSaftImport(){
     saftPending = null;
   }catch(err){
     preview.innerHTML = '<div class="empty-state">Erro ao gravar: ' + err.message + '</div>';
+  } finally {
+    saftImportEmProgresso = false;
   }
 }
 
