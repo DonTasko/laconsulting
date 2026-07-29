@@ -264,9 +264,21 @@ async function apiCallPost(bodyObj){
   if(API_URL.indexOf('COLA_AQUI') !== -1){
     throw new Error('Ainda não configuraste o API_URL no topo do <script>.');
   }
-  const res = await fetch(API_URL, { method:'POST', body: JSON.stringify(bodyObj) });
-  if(!res.ok) throw new Error('Falha de rede (' + res.status + ')');
-  return res.json();
+  const tentar = async () => {
+    const res = await fetch(API_URL, { method:'POST', body: JSON.stringify(bodyObj) });
+    if(!res.ok) throw new Error('Falha de rede (' + res.status + ')');
+    return res.json();
+  };
+
+  const r1 = await tentar();
+  // O Web App do Apps Script faz sempre um redirecionamento interno antes de responder, e esse
+  // salto ocasionalmente perde o corpo de um pedido POST (mais comum logo a seguir a publicar uma
+  // versão nova). Se isso acontecer, o backend cai no "Ação inválida: undefined" — tentamos mais
+  // uma vez automaticamente antes de desistir.
+  if(!r1.success && String(r1.error||'').indexOf('Ação inválida') !== -1){
+    return await tentar();
+  }
+  return r1;
 }
 
 /* ---------------- login cliente ---------------- */
