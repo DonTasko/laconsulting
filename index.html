@@ -360,7 +360,7 @@ function deltaArrow(dir){
 function renderClientDashboard(data){
   const m = data.metrics || {};
   const fat = computeFaturacaoSummary(data.vendas);
-  const custosInfo = computeCustosSummary(data.custos);
+  const custosInfo = computeCustosSummary(data.itensComprados);
   const margemInfo = computeMargemSummary(fat, custosInfo, m);
   const impostoInfo = computeImpostoEstimado(fat, margemInfo, data.derrama_municipal);
   const saldoInfo = computeSaldoEstimado(data.movimentos, m);
@@ -419,22 +419,37 @@ function computeFaturacaoSummary(vendas){
   return { total, deltaLabel, dir, ultimoMes: ordenado.length ? Number(ordenado[ordenado.length-1].total_faturado)||0 : null };
 }
 
-// Mesma lógica da faturação, mas para a tab CustosMensais (opcional — pode não existir ainda).
-function computeCustosSummary(custos){
-  if(!custos || !custos.length) return { total:null, ultimoMes:null };
+// Custos mensais = soma de ItensComprados (faturas digitalizadas) agrupada por mês, a partir de
+// data_compra. Substitui a ideia anterior de uma tab manual "CustosMensais" — os custos aparecem
+// à medida que as faturas de compra vão sendo digitalizadas na app. Cobertura parcial: só reflete
+// o que já foi carregado, não a totalidade real das despesas da empresa.
+function computeCustosSummary(itensComprados){
+  if(!itensComprados || !itensComprados.length) return { total:null, ultimoMes:null };
 
-  const anoAtual = new Date().getFullYear();
-  const doAno = custos.filter(c => Number(c.ano) === anoAtual);
-  const base = doAno.length ? doAno : custos;
-  const total = base.reduce((s, c) => s + (Number(c.custos_totais) || 0), 0);
-
-  const ordenado = custos.slice().sort((a, b) => {
-    const chaveA = Number(a.ano) * 12 + (MESES_PT_FULL[String(a.mes).toLowerCase()] ?? 0);
-    const chaveB = Number(b.ano) * 12 + (MESES_PT_FULL[String(b.mes).toLowerCase()] ?? 0);
-    return chaveA - chaveB;
+  const porMes = {}; // chave "ano-mesIdx" -> soma
+  itensComprados.forEach(it => {
+    const data = parseDeadlineDate(it.data_compra);
+    if(!data) return; // sem data legível, não entra na soma mensal
+    const chave = data.getFullYear() + '-' + data.getMonth();
+    porMes[chave] = (porMes[chave] || 0) + (Number(it.valor_total) || 0);
   });
 
-  return { total, ultimoMes: ordenado.length ? Number(ordenado[ordenado.length-1].custos_totais)||0 : null };
+  const chaves = Object.keys(porMes);
+  if(!chaves.length) return { total:null, ultimoMes:null };
+
+  const anoAtual = new Date().getFullYear();
+  const chavesDoAno = chaves.filter(k => Number(k.split('-')[0]) === anoAtual);
+  const baseChaves = chavesDoAno.length ? chavesDoAno : chaves;
+  const total = baseChaves.reduce((s, k) => s + porMes[k], 0);
+
+  const chavesOrdenadas = chaves.slice().sort((a, b) => {
+    const [anoA, mesA] = a.split('-').map(Number);
+    const [anoB, mesB] = b.split('-').map(Number);
+    return (anoA*12 + mesA) - (anoB*12 + mesB);
+  });
+  const ultimaChave = chavesOrdenadas[chavesOrdenadas.length - 1];
+
+  return { total, ultimoMes: porMes[ultimaChave] };
 }
 
 // Margem automática = (faturação - custos) / faturação, só quando há dados reais de CustosMensais
@@ -711,6 +726,8 @@ function renderSection(title, innerHtml){
 
 let ocrExtraido = null;
 let ocrEmProgresso = false;
+let ocrFicheiroBase64 = null;
+let ocrFicheiroMimeType = null;
 
 function renderOcrUploader(){
   return `
@@ -772,6 +789,8 @@ async function handleOcrFile(){
   result.innerHTML = '<div class="loading">A ler a fatura…</div>';
   try{
     const { base64, mimeType } = await resizeImageFile(input.files[0]);
+    ocrFicheiroBase64 = base64;
+    ocrFicheiroMimeType = mimeType;
     const r = await apiCallPost({
       action: 'ocrInvoice',
       nif: session.nif,
@@ -852,15 +871,19 @@ async function confirmOcrSave(){
     };
   });
 
-  result.innerHTML = '<div class="loading">A gravar…</div>';
+  result.innerHTML = '<div class="loading">A gravar e a enviar ao contabilista…</div>';
   try{
     const r = await apiCallPost({
       action: 'saveItemComprado',
       nif: session.nif,
       token: session.token,
-      itens: JSON.stringify(itens)
+      itens: JSON.stringify(itens),
+      image_base64: ocrFicheiroBase64,
+      mime_type: ocrFicheiroMimeType
     });
     if(!r.success) throw new Error(r.error || 'Erro desconhecido');
+    ocrFicheiroBase64 = null;
+    ocrFicheiroMimeType = null;
     result.innerHTML = '<div class="empty-state">Fatura gravada com sucesso.</div>';
     ocrExtraido = null;
   }catch(err){
@@ -1126,7 +1149,7 @@ async function loadAdminDetail(nif){
     if(!r.success){ c.innerHTML = '<div class="empty-state">'+ (r.error||'Erro.') +'</div>'; return; }
     document.getElementById('topbar-company').textContent = r.empresa || nif;
     const fat = computeFaturacaoSummary(r.vendas);
-    const custosInfo = computeCustosSummary(r.custos);
+    const custosInfo = computeCustosSummary(r.itensComprados);
     const margemInfo = computeMargemSummary(fat, custosInfo, r.metrics || {});
     const impostoInfo = computeImpostoEstimado(fat, margemInfo, r.derrama_municipal);
     const saldoInfo = computeSaldoEstimado(r.movimentos, r.metrics || {});
