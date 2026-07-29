@@ -319,6 +319,7 @@ function enterApp(){
 
 function logout(){
   session = { mode:null, nif:null, token:null, adminPassword:null };
+  chatHistorico = [];
   document.getElementById('login-screen').style.display = 'flex';
   document.getElementById('app-screen').style.display = 'none';
   document.getElementById('input-token').value = '';
@@ -369,6 +370,7 @@ function renderClientDashboard(data){
     ${renderKpiGridFixed(m, fat)}
     ${gauge}
     ${renderOcrUploader()}
+    ${renderFiscalChat()}
     ${renderSection('Prazos fiscais', renderDeadlinesHeader(data) + renderDeadlines(data.deadlines))}
     ${renderSection('Movimentos recentes', renderMovimentos(data.movimentos))}
     ${renderSection('Vendas mensais', renderVendas(data.vendas))}
@@ -779,6 +781,80 @@ async function confirmOcrSave(){
     result.innerHTML = '<div class="empty-state">Erro ao gravar: ' + err.message + '</div>';
   }finally{
     ocrEmProgresso = false;
+  }
+}
+
+/* ===================== Assistente de IA fiscal ===================== *
+ * O aviso abaixo é fixo e aparece sempre — este assistente dá orientação geral, não é
+ * aconselhamento fiscal vinculativo. A instrução que o proíbe de inventar artigos de lei está
+ * no backend (Code.gs), não aqui — nunca contornar isso no frontend. */
+
+let chatHistorico = [];
+let chatEmProgresso = false;
+
+function renderFiscalChat(){
+  return `
+    <section class="block">
+      <div class="block-title">Assistente fiscal</div>
+      <div class="li-sub" style="margin-bottom:10px; padding:10px 12px; background:rgba(201,138,52,0.1); border:1px solid rgba(201,138,52,0.3); border-radius:9px; color:var(--amber);">
+        Este assistente dá orientação geral e pode errar, sobretudo em números de artigos, taxas e prazos. Não substitui o teu contabilista certificado — confirma sempre decisões importantes com ele antes de agir.
+      </div>
+      <div id="chat-mensagens" style="display:flex; flex-direction:column; gap:8px; margin-bottom:10px;"></div>
+      <div style="display:flex; gap:8px;">
+        <input id="chat-input" placeholder="Escreve a tua pergunta…" style="flex:1; padding:12px 14px; background:var(--ink); border:1px solid var(--line); border-radius:9px; color:var(--text); font-family:var(--font-body); font-size:14px;" onkeydown="if(event.key==='Enter') enviarMensagemChat();">
+        <button class="btn-primary" style="width:auto; margin-top:0; padding:12px 18px;" onclick="enviarMensagemChat()">Enviar</button>
+      </div>
+    </section>
+  `;
+}
+
+function renderMensagemChat(role, texto){
+  const isUser = role === 'user';
+  return `
+    <div style="align-self:${isUser ? 'flex-end' : 'flex-start'}; max-width:85%; background:${isUser ? 'var(--accent-dim)' : 'var(--panel-2)'}; border:1px solid var(--line); border-radius:12px; padding:10px 13px; font-size:13.5px; line-height:1.5; white-space:pre-wrap;">
+      ${texto}
+    </div>
+  `;
+}
+
+async function enviarMensagemChat(){
+  if(chatEmProgresso) return;
+  const input = document.getElementById('chat-input');
+  const texto = input.value.trim();
+  if(!texto) return;
+
+  const mensagens = document.getElementById('chat-mensagens');
+  chatHistorico.push({ role:'user', text: texto });
+  mensagens.innerHTML += renderMensagemChat('user', texto);
+  input.value = '';
+  mensagens.scrollTop = mensagens.scrollHeight;
+
+  chatEmProgresso = true;
+  const idLoading = 'chat-loading-' + Date.now();
+  mensagens.innerHTML += `<div id="${idLoading}" style="align-self:flex-start; color:var(--text-dim); font-size:13px;">A pensar…</div>`;
+  mensagens.scrollTop = mensagens.scrollHeight;
+
+  try{
+    const r = await apiCallPost({
+      action:'fiscalChat',
+      nif: session.nif,
+      token: session.token,
+      historico: JSON.stringify(chatHistorico)
+    });
+    document.getElementById(idLoading).remove();
+    if(!r.success){
+      mensagens.innerHTML += renderMensagemChat('assistant', 'Erro: ' + (r.error || 'não consegui responder.'));
+      return;
+    }
+    chatHistorico.push({ role:'assistant', text: r.resposta });
+    mensagens.innerHTML += renderMensagemChat('assistant', r.resposta);
+  }catch(err){
+    const el = document.getElementById(idLoading);
+    if(el) el.remove();
+    mensagens.innerHTML += renderMensagemChat('assistant', 'Erro: ' + err.message);
+  }finally{
+    chatEmProgresso = false;
+    mensagens.scrollTop = mensagens.scrollHeight;
   }
 }
 
