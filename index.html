@@ -845,7 +845,10 @@ function renderOcrReviewForm(dados, id, nomeFicheiro){
 
   const linhasItens = itens.map((it, i) => `
     <div class="list-item" style="flex-direction:column; align-items:stretch; gap:6px;">
-      <input class="ocr-item-desc-${id}" data-i="${i}" value="${(it.descricao||'').replace(/"/g,'&quot;')}" placeholder="Descrição">
+      <div style="display:flex; gap:8px; align-items:center;">
+        <input class="ocr-item-desc-${id}" data-i="${i}" value="${(it.descricao||'').replace(/"/g,'&quot;')}" placeholder="Descrição" style="flex:1;">
+        <button type="button" onclick="this.closest('.list-item').remove()" title="Não considerar este item" style="background:none; border:1px solid var(--line); color:var(--rust); border-radius:8px; width:32px; height:32px; flex-shrink:0; cursor:pointer; font-size:16px; line-height:1;">×</button>
+      </div>
       <div style="display:flex; gap:8px;">
         <input class="ocr-item-qtd-${id}" data-i="${i}" value="${it.quantidade ?? 1}" placeholder="Qtd" style="width:70px; padding:8px; background:var(--ink); border:1px solid var(--line); border-radius:8px; color:var(--text); font-family:var(--font-mono);">
         <input class="ocr-item-unit-${id}" data-i="${i}" value="${it.valor_unitario ?? ''}" placeholder="Valor unit." style="flex:1; padding:8px; background:var(--ink); border:1px solid var(--line); border-radius:8px; color:var(--text); font-family:var(--font-mono);">
@@ -868,9 +871,15 @@ function renderOcrReviewForm(dados, id, nomeFicheiro){
 async function confirmOcrSave(id, forcar){
   const lote = ocrLotes[id];
   if(!lote || ocrEmProgresso) return;
-  ocrEmProgresso = true;
   const resultado = document.getElementById('ocr-resultado-' + id);
 
+  const descs = Array.from(document.querySelectorAll(`.ocr-item-desc-${id}`));
+  if(!descs.length){
+    resultado.innerHTML = '<div class="empty-state">Removeste todos os itens — não há nada para gravar. Volta a ler o ficheiro se foi engano.</div>';
+    return;
+  }
+
+  ocrEmProgresso = true;
   const fornecedor_nif = document.getElementById(`ocr-f-nif-${id}`).value.trim();
   const fornecedor_nome = document.getElementById(`ocr-f-nome-${id}`).value.trim();
   const numero_fatura = document.getElementById(`ocr-f-numero-${id}`).value.trim();
@@ -878,7 +887,6 @@ async function confirmOcrSave(id, forcar){
   const taxa_iva = document.getElementById(`ocr-f-iva-${id}`).value.trim();
   const categoria = document.getElementById(`ocr-f-categoria-${id}`).value.trim();
 
-  const descs = Array.from(document.querySelectorAll(`.ocr-item-desc-${id}`));
   const itens = descs.map(el => {
     const i = el.dataset.i;
     const qtd = document.querySelector(`.ocr-item-qtd-${id}[data-i="${i}"]`).value;
