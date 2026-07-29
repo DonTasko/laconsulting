@@ -378,7 +378,7 @@ function renderClientDashboard(data){
     ${renderFiscalChat()}
     ${renderSection('Prazos fiscais', renderDeadlinesHeader(data) + renderDeadlines(data.deadlines))}
     ${renderSection('Movimentos recentes', renderMovimentos(data.movimentos))}
-    ${renderSection('Vendas mensais', renderVendas(data.vendas))}
+    ${renderSection('Vendas e custos mensais', renderVendas(data.vendas, data.itensComprados))}
     ${renderTaxEstimator(fat, m, margemInfo, data.derrama_municipal)}
     ${renderSection('Comparação com o setor', renderBenchmark(data.benchmark))}
   `;
@@ -1032,17 +1032,81 @@ function renderMovimentos(movimentos){
   }).join('');
 }
 
-function renderVendas(vendas){
+// Agrupa ItensComprados por mês (a partir de data_compra), somando o total pago e extraindo o IVA
+// dedutível a partir da taxa_iva. Assume que valor_total já inclui IVA (normal numa fatura de
+// compra). NÃO aplica restrições legais de dedutibilidade (viaturas, despesas de representação,
+// etc.) — é uma estimativa simplificada, não o cálculo oficial.
+function groupItensPorMes(itensComprados){
+  const porMes = {};
+  (itensComprados || []).forEach(it => {
+    const data = parseDeadlineDate(it.data_compra);
+    if(!data) return;
+    const chave = data.getFullYear() + '-' + data.getMonth();
+    if(!porMes[chave]) porMes[chave] = { custosTotal: 0, ivaDedutivel: 0 };
+    const total = Number(it.valor_total) || 0;
+    const taxa = Number(it.taxa_iva) || 0;
+    const iva = taxa > 0 ? total * (taxa / (100 + taxa)) : 0;
+    porMes[chave].custosTotal += total;
+    porMes[chave].ivaDedutivel += iva;
+  });
+  return porMes;
+}
+
+function renderVendas(vendas, itensComprados){
   if(!vendas || !vendas.length) return '<div class="empty-state">Sem vendas mensais registadas.</div>';
-  const max = Math.max(...vendas.map(v => Number(v.total_faturado) || 0), 1);
-  return vendas.map(v => {
-    const pct = Math.round(((Number(v.total_faturado)||0) / max) * 100);
-    return `<div class="bench-row">
-      <div class="bench-label">${(v.mes||'')}/${v.ano||''}</div>
-      <div class="bench-bar-track"><div class="bench-bar-fill" style="width:${pct}%; background:#2F8F6B;"></div></div>
-      <div class="bench-value">${fmtEUR(v.total_faturado)}</div>
-    </div>`;
+
+  const custosPorMes = groupItensPorMes(itensComprados);
+  const ordenado = vendas.slice().sort((a, b) => {
+    const chaveA = Number(a.ano) * 12 + (MESES_PT_FULL[String(a.mes).toLowerCase()] ?? 0);
+    const chaveB = Number(b.ano) * 12 + (MESES_PT_FULL[String(b.mes).toLowerCase()] ?? 0);
+    return chaveA - chaveB;
+  });
+
+  const maxVal = Math.max(
+    ...ordenado.map(v => Number(v.total_faturado) || 0),
+    ...Object.values(custosPorMes).map(c => c.custosTotal),
+    1
+  );
+
+  const linhas = ordenado.map(v => {
+    const mesIdx = MESES_PT_FULL[String(v.mes).toLowerCase()] ?? 0;
+    const chave = Number(v.ano) + '-' + mesIdx;
+    const custos = custosPorMes[chave] || { custosTotal: 0, ivaDedutivel: 0 };
+    const ivaLiquidado = Number(v.iva_liquidado) || 0;
+    const ivaAPagar = ivaLiquidado - custos.ivaDedutivel;
+
+    const pctVendas = Math.round(((Number(v.total_faturado) || 0) / maxVal) * 100);
+    const pctCustos = Math.round((custos.custosTotal / maxVal) * 100);
+
+    return `
+      <div style="margin-bottom:16px; padding-bottom:14px; border-bottom:1px solid var(--line);">
+        <div class="li-sub" style="margin-bottom:6px; font-weight:600;">${v.mes || ''}/${v.ano || ''}</div>
+        <div class="bench-row">
+          <div class="bench-label">Vendas</div>
+          <div class="bench-bar-track"><div class="bench-bar-fill" style="width:${pctVendas}%; background:#2F8F6B;"></div></div>
+          <div class="bench-value">${fmtEUR(v.total_faturado)}</div>
+        </div>
+        <div class="bench-row">
+          <div class="bench-label">Custos</div>
+          <div class="bench-bar-track"><div class="bench-bar-fill" style="width:${pctCustos}%; background:#C0503D;"></div></div>
+          <div class="bench-value">${fmtEUR(Math.round(custos.custosTotal))}</div>
+        </div>
+        <div class="li-sub" style="margin-top:6px; font-family:var(--font-mono); font-size:12px;">
+          IVA liquidado ${fmtEUR(Math.round(ivaLiquidado))} − IVA dedutível ${fmtEUR(Math.round(custos.ivaDedutivel))} =
+          <strong style="color:${ivaAPagar >= 0 ? 'var(--rust)' : 'var(--accent)'};">
+            ${ivaAPagar >= 0 ? 'a entregar' : 'a favor'} ${fmtEUR(Math.round(Math.abs(ivaAPagar)))}
+          </strong>
+        </div>
+      </div>
+    `;
   }).join('');
+
+  return `
+    <div class="li-sub" style="margin-bottom:10px; padding:10px 12px; background:rgba(201,138,52,0.1); border:1px solid rgba(201,138,52,0.3); border-radius:9px; color:var(--amber);">
+      Custos e IVA dedutível só refletem faturas de compra já digitalizadas na app. O IVA a entregar é uma estimativa — não aplica restrições legais de dedutibilidade (viaturas, despesas de representação, etc.) nem substitui a declaração periódica de IVA feita pelo teu contabilista.
+    </div>
+    ${linhas}
+  `;
 }
 
 function renderBenchmark(b){
@@ -1200,7 +1264,7 @@ async function loadAdminDetail(nif){
       ${renderDeadlinesHeader(r)}
       ${renderSection('Prazos fiscais', renderDeadlinesAdmin(r.deadlines, nif))}
       ${renderSection('Movimentos', renderMovimentosAdmin(r.movimentos, nif))}
-      ${renderSection('Vendas mensais', renderVendas(r.vendas))}
+      ${renderSection('Vendas e custos mensais', renderVendas(r.vendas, r.itensComprados))}
       ${renderSection('Itens comprados', renderItensComprados(r.itensComprados))}
     `;
   }catch(err){
