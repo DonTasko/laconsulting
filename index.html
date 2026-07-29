@@ -374,6 +374,7 @@ function renderClientDashboard(data){
     ${renderSection('Prazos fiscais', renderDeadlinesHeader(data) + renderDeadlines(data.deadlines))}
     ${renderSection('Movimentos recentes', renderMovimentos(data.movimentos))}
     ${renderSection('Vendas mensais', renderVendas(data.vendas))}
+    ${renderTaxEstimator(fat, m)}
     ${renderSection('Comparação com o setor', renderBenchmark(data.benchmark))}
   `;
 }
@@ -900,15 +901,17 @@ function renderVendas(vendas){
 }
 
 function renderBenchmark(b){
-  if(!b || Object.keys(b).length <= 1) return '<div class="empty-state">Sem dados de benchmarking disponíveis.</div>';
+  const nota = `<div class="li-sub" style="margin-bottom:10px;">Estes valores vêm da tab "Benchmark" da sheet — não são recolhidos automaticamente. Para preencheres com dados reais de setor, os <a href="https://www.bportugal.pt/page/quadros-da-empresa-e-do-setor" target="_blank" style="color:var(--accent);">Quadros do Setor do Banco de Portugal</a> são gratuitos e comparam empresas por setor de atividade e dimensão.</div>`;
+
+  if(!b || Object.keys(b).length <= 1) return nota + '<div class="empty-state">Sem dados de benchmarking disponíveis.</div>';
   // Assunção: coluna B = valor da tua empresa, coluna C = média do setor, coluna D = unidade (ex: "%")
   const keys = Object.keys(b).filter(k => k !== 'nif' && k !== '_rowIndex');
-  if(keys.length < 2) return '<div class="empty-state">Sem dados de benchmarking disponíveis.</div>';
+  if(keys.length < 2) return nota + '<div class="empty-state">Sem dados de benchmarking disponíveis.</div>';
   const empresaVal = Number(b[keys[0]]);
   const setorVal = Number(b[keys[1]]);
   const unidade = b[keys[2]] || '';
   const max = Math.max(empresaVal, setorVal, 1);
-  return `
+  return nota + `
     <div class="bench-row">
       <div class="bench-label">A tua empresa</div>
       <div class="bench-bar-track"><div class="bench-bar-fill" style="width:${Math.round(empresaVal/max*100)}%; background:#2F8F6B;"></div></div>
@@ -919,6 +922,81 @@ function renderBenchmark(b){
       <div class="bench-bar-track"><div class="bench-bar-fill" style="width:${Math.round(setorVal/max*100)}%; background:#8A93A6;"></div></div>
       <div class="bench-value">${setorVal}${unidade}</div>
     </div>
+  `;
+}
+
+/* ===================== Calculadora de estimativa de IRC ===================== *
+ * Taxas confirmadas para períodos de tributação com início em 2026 (Orçamento do Estado 2026):
+ * PME/Small Mid Cap: 15% sobre os primeiros 50.000€ de matéria coletável, 19% no remanescente.
+ * Empresas não-PME: 19% sobre a totalidade. Derrama municipal: até 1,5%, varia por município —
+ * o utilizador tem de indicar a taxa do seu município (consultar Ofício Circulado anual da AT).
+ * NÃO calcula tributações autónomas nem derrama estadual (lucros > 1,5M€) — complexo demais para
+ * estimar sem dados de despesas detalhados; fica expressamente fora, para não dar um número falso
+ * de confiança. Cálculo 100% no browser, sem chamar nenhuma API — não há custo nem risco de dados. */
+
+function renderTaxEstimator(fat, metrics){
+  const margemPct = Number(metrics.margem_delta);
+  const lucroEstimado = (fat && fat.total !== null && !isNaN(margemPct))
+    ? Math.round(fat.total * (margemPct / 100))
+    : '';
+
+  return `
+    <section class="block">
+      <div class="block-title">Estimativa de IRC (pré-trimestre)</div>
+      <div class="li-sub" style="margin-bottom:10px; padding:10px 12px; background:rgba(201,138,52,0.1); border:1px solid rgba(201,138,52,0.3); border-radius:9px; color:var(--amber);">
+        Estimativa aproximada com as taxas de 2026. Não inclui tributações autónomas, benefícios fiscais nem derrama estadual — não substitui o cálculo oficial feito pelo teu contabilista.
+      </div>
+      <div class="field">
+        <label>Matéria coletável estimada (€)</label>
+        <input id="irc-materia" type="number" value="${lucroEstimado}" placeholder="Ex: 45000">
+      </div>
+      <div class="field">
+        <label>Derrama municipal (%) — consulta a taxa do teu município</label>
+        <input id="irc-derrama" type="number" step="0.1" value="0" placeholder="Ex: 1.5">
+      </div>
+      <div style="display:flex; align-items:center; gap:8px; margin-bottom:14px;">
+        <input type="checkbox" id="irc-pme" checked style="width:16px; height:16px;">
+        <label for="irc-pme" style="font-size:13px; color:var(--text-dim);">A empresa qualifica como PME / Small Mid Cap</label>
+      </div>
+      <button class="btn-primary" onclick="calcularIRC()">Calcular</button>
+      <div id="irc-resultado"></div>
+    </section>
+  `;
+}
+
+function calcularIRC(){
+  const materia = Number(document.getElementById('irc-materia').value);
+  const derramaPct = Number(document.getElementById('irc-derrama').value) || 0;
+  const isPme = document.getElementById('irc-pme').checked;
+  const resultado = document.getElementById('irc-resultado');
+
+  if(!materia || materia <= 0){
+    resultado.innerHTML = '<div class="empty-state">Indica uma matéria coletável estimada maior que zero.</div>';
+    return;
+  }
+
+  let irc;
+  if(isPme){
+    const primeiroEscalao = Math.min(materia, 50000);
+    const restante = Math.max(0, materia - 50000);
+    irc = primeiroEscalao * 0.15 + restante * 0.19;
+  } else {
+    irc = materia * 0.19;
+  }
+
+  const derrama = materia * (derramaPct / 100);
+  const total = irc + derrama;
+
+  let avisoEstadual = '';
+  if(materia > 1500000){
+    avisoEstadual = '<div class="li-sub" style="margin-top:8px; color:var(--amber);">A matéria coletável ultrapassa 1,5M€ — pode aplicar-se também derrama estadual, que esta calculadora não inclui.</div>';
+  }
+
+  resultado.innerHTML = `
+    <div class="list-item"><div class="li-main"><div class="li-title">IRC (${isPme ? '15%/19% PME' : '19%'})</div></div><div class="li-title">${fmtEUR(Math.round(irc))}</div></div>
+    <div class="list-item"><div class="li-main"><div class="li-title">Derrama municipal (${derramaPct}%)</div></div><div class="li-title">${fmtEUR(Math.round(derrama))}</div></div>
+    <div class="list-item" style="border-left:3px solid var(--accent);"><div class="li-main"><div class="li-title">Total estimado</div></div><div class="li-title">${fmtEUR(Math.round(total))}</div></div>
+    ${avisoEstadual}
   `;
 }
 
