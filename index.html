@@ -320,6 +320,7 @@ function enterApp(){
 function logout(){
   session = { mode:null, nif:null, token:null, adminPassword:null };
   chatHistorico = [];
+  ocrLotes = {};
   document.getElementById('login-screen').style.display = 'flex';
   document.getElementById('app-screen').style.display = 'none';
   document.getElementById('input-token').value = '';
@@ -724,21 +725,21 @@ function renderSection(title, innerHtml){
  * aparece num formulário EDITÁVEL — o cliente confirma/corrige antes de qualquer coisa ser
  * gravada em ItensComprados. Nunca gravamos automaticamente o que o OCR "leu". */
 
-let ocrExtraido = null;
+let ocrLotes = {}; // id -> { base64, mimeType, dados }
 let ocrEmProgresso = false;
-let ocrFicheiroBase64 = null;
-let ocrFicheiroMimeType = null;
+let ocrProximoId = 1;
 
 function renderOcrUploader(){
   return `
     <section class="block">
-      <div class="block-title">Enviar fatura (leitura automática)</div>
+      <div class="block-title">Enviar faturas (leitura automática)</div>
       <div class="list-item" style="flex-direction:column; align-items:stretch; gap:10px;">
-        <div class="li-sub">Tira uma foto ou carrega um PDF de uma fatura de compra. A app tenta ler o fornecedor, o valor e o IVA — depois mostra-te os dados para confirmares.</div>
-        <input type="file" id="ocr-file-input" accept="image/*,.pdf" style="color:var(--text-dim); font-size:12px;">
-        <button class="btn-primary" style="margin-top:0;" onclick="handleOcrFile()">Ler fatura</button>
+        <div class="li-sub">Tira fotos ou carrega PDFs de faturas de compra — podes escolher vários de uma vez. A app lê cada um, e mostra-te os dados para confirmares antes de gravar.</div>
+        <input type="file" id="ocr-file-input" accept="image/*,.pdf" multiple style="color:var(--text-dim); font-size:12px;">
+        <button class="btn-primary" style="margin-top:0;" onclick="handleOcrFile()">Ler faturas</button>
       </div>
-      <div id="ocr-result"></div>
+      <div id="ocr-status"></div>
+      <div id="ocr-cartoes"></div>
     </section>
   `;
 }
@@ -779,36 +780,51 @@ function resizeImageFile(file){
   });
 }
 
+// Processa os ficheiros um a um (sequencial de propósito — evita sobrecarregar o Apps Script com
+// pedidos em paralelo). Cada ficheiro que falhar mostra o próprio erro e não trava os restantes.
 async function handleOcrFile(){
   if(ocrEmProgresso) return;
   const input = document.getElementById('ocr-file-input');
-  const result = document.getElementById('ocr-result');
-  if(!input.files.length){ result.innerHTML = '<div class="empty-state">Escolhe uma foto ou PDF primeiro.</div>'; return; }
+  const status = document.getElementById('ocr-status');
+  const cartoes = document.getElementById('ocr-cartoes');
+  const ficheiros = Array.from(input.files || []);
+  if(!ficheiros.length){ status.innerHTML = '<div class="empty-state">Escolhe pelo menos uma foto ou PDF.</div>'; return; }
 
   ocrEmProgresso = true;
-  result.innerHTML = '<div class="loading">A ler a fatura…</div>';
-  try{
-    const { base64, mimeType } = await resizeImageFile(input.files[0]);
-    ocrFicheiroBase64 = base64;
-    ocrFicheiroMimeType = mimeType;
-    const r = await apiCallPost({
-      action: 'ocrInvoice',
-      nif: session.nif,
-      token: session.token,
-      image_base64: base64,
-      mime_type: mimeType
-    });
-    if(!r.success){ result.innerHTML = '<div class="empty-state">'+ (r.error || 'Não consegui ler esta fatura.') +'</div>'; return; }
-    ocrExtraido = r.dados;
-    result.innerHTML = renderOcrReviewForm(r.dados);
-  }catch(err){
-    result.innerHTML = '<div class="empty-state">'+ err.message +'</div>';
-  }finally{
-    ocrEmProgresso = false;
+  let concluidos = 0, falhas = 0;
+
+  for(const file of ficheiros){
+    status.innerHTML = `<div class="loading">A ler fatura ${concluidos + falhas + 1} de ${ficheiros.length}…</div>`;
+    try{
+      const { base64, mimeType } = await resizeImageFile(file);
+      const r = await apiCallPost({
+        action: 'ocrInvoice',
+        nif: session.nif,
+        token: session.token,
+        image_base64: base64,
+        mime_type: mimeType
+      });
+      if(!r.success){
+        falhas++;
+        cartoes.innerHTML += `<div class="empty-state">${file.name}: ${r.error || 'não consegui ler.'}</div>`;
+        continue;
+      }
+      const id = 'ocr' + (ocrProximoId++);
+      ocrLotes[id] = { base64, mimeType, dados: r.dados };
+      cartoes.innerHTML += renderOcrReviewForm(r.dados, id, file.name);
+      concluidos++;
+    }catch(err){
+      falhas++;
+      cartoes.innerHTML += `<div class="empty-state">${file.name}: ${err.message}</div>`;
+    }
   }
+
+  status.innerHTML = `<div class="li-sub">Lidas ${concluidos} de ${ficheiros.length} fatura(s)${falhas ? ' — ' + falhas + ' falharam' : ''}.</div>`;
+  input.value = '';
+  ocrEmProgresso = false;
 }
 
-function renderOcrReviewForm(dados){
+function renderOcrReviewForm(dados, id, nomeFicheiro){
   const itens = (dados.itens && dados.itens.length) ? dados.itens : [{
     descricao: dados.categoria || 'Compra',
     quantidade: 1,
@@ -817,52 +833,57 @@ function renderOcrReviewForm(dados){
   }];
 
   const camposComuns = `
+    <div class="li-sub" style="margin-bottom:4px; font-weight:600;">${nomeFicheiro || ''}</div>
     <div class="li-sub" style="margin-bottom:8px; color:var(--amber);">Confirma ou corrige os dados antes de gravar — a leitura automática pode errar, sobretudo em números.</div>
-    <div class="field"><label>NIF do fornecedor</label><input id="ocr-f-nif" value="${dados.fornecedor_nif || ''}"></div>
-    <div class="field"><label>Nome do fornecedor</label><input id="ocr-f-nome" value="${dados.fornecedor_nome || ''}"></div>
-    <div class="field"><label>Nº da fatura</label><input id="ocr-f-numero" value="${dados.numero_fatura || ''}"></div>
-    <div class="field"><label>Data da compra (AAAA-MM-DD)</label><input id="ocr-f-data" value="${dados.data_compra || ''}"></div>
-    <div class="field"><label>Taxa de IVA (%)</label><input id="ocr-f-iva" value="${dados.taxa_iva ?? ''}" inputmode="decimal"></div>
-    <div class="field"><label>Categoria</label><input id="ocr-f-categoria" value="${dados.categoria || ''}"></div>
+    <div class="field"><label>NIF do fornecedor</label><input id="ocr-f-nif-${id}" value="${dados.fornecedor_nif || ''}"></div>
+    <div class="field"><label>Nome do fornecedor</label><input id="ocr-f-nome-${id}" value="${dados.fornecedor_nome || ''}"></div>
+    <div class="field"><label>Nº da fatura</label><input id="ocr-f-numero-${id}" value="${dados.numero_fatura || ''}"></div>
+    <div class="field"><label>Data da compra (AAAA-MM-DD)</label><input id="ocr-f-data-${id}" value="${dados.data_compra || ''}"></div>
+    <div class="field"><label>Taxa de IVA (%)</label><input id="ocr-f-iva-${id}" value="${dados.taxa_iva ?? ''}" inputmode="decimal"></div>
+    <div class="field"><label>Categoria</label><input id="ocr-f-categoria-${id}" value="${dados.categoria || ''}"></div>
   `;
 
   const linhasItens = itens.map((it, i) => `
     <div class="list-item" style="flex-direction:column; align-items:stretch; gap:6px;">
-      <input class="ocr-item-desc" data-i="${i}" value="${(it.descricao||'').replace(/"/g,'&quot;')}" placeholder="Descrição">
+      <input class="ocr-item-desc-${id}" data-i="${i}" value="${(it.descricao||'').replace(/"/g,'&quot;')}" placeholder="Descrição">
       <div style="display:flex; gap:8px;">
-        <input class="ocr-item-qtd" data-i="${i}" value="${it.quantidade ?? 1}" placeholder="Qtd" style="width:70px; padding:8px; background:var(--ink); border:1px solid var(--line); border-radius:8px; color:var(--text); font-family:var(--font-mono);">
-        <input class="ocr-item-unit" data-i="${i}" value="${it.valor_unitario ?? ''}" placeholder="Valor unit." style="flex:1; padding:8px; background:var(--ink); border:1px solid var(--line); border-radius:8px; color:var(--text); font-family:var(--font-mono);">
-        <input class="ocr-item-total" data-i="${i}" value="${it.valor_total ?? ''}" placeholder="Total" style="flex:1; padding:8px; background:var(--ink); border:1px solid var(--line); border-radius:8px; color:var(--text); font-family:var(--font-mono);">
+        <input class="ocr-item-qtd-${id}" data-i="${i}" value="${it.quantidade ?? 1}" placeholder="Qtd" style="width:70px; padding:8px; background:var(--ink); border:1px solid var(--line); border-radius:8px; color:var(--text); font-family:var(--font-mono);">
+        <input class="ocr-item-unit-${id}" data-i="${i}" value="${it.valor_unitario ?? ''}" placeholder="Valor unit." style="flex:1; padding:8px; background:var(--ink); border:1px solid var(--line); border-radius:8px; color:var(--text); font-family:var(--font-mono);">
+        <input class="ocr-item-total-${id}" data-i="${i}" value="${it.valor_total ?? ''}" placeholder="Total" style="flex:1; padding:8px; background:var(--ink); border:1px solid var(--line); border-radius:8px; color:var(--text); font-family:var(--font-mono);">
       </div>
     </div>
   `).join('');
 
   return `
-    ${camposComuns}
-    <div class="block-title" style="font-size:14px; margin-top:16px;">Itens</div>
-    ${linhasItens}
-    <button class="btn-primary" onclick="confirmOcrSave()">Guardar fatura</button>
+    <section class="block" id="ocr-card-${id}" style="border-top:1px solid var(--line); padding-top:16px;">
+      ${camposComuns}
+      <div class="block-title" style="font-size:14px; margin-top:16px;">Itens</div>
+      ${linhasItens}
+      <button class="btn-primary" onclick="confirmOcrSave('${id}')">Guardar fatura</button>
+      <div id="ocr-resultado-${id}"></div>
+    </section>
   `;
 }
 
-async function confirmOcrSave(){
-  if(!ocrExtraido || ocrEmProgresso) return;
+async function confirmOcrSave(id, forcar){
+  const lote = ocrLotes[id];
+  if(!lote || ocrEmProgresso) return;
   ocrEmProgresso = true;
-  const result = document.getElementById('ocr-result');
+  const resultado = document.getElementById('ocr-resultado-' + id);
 
-  const fornecedor_nif = document.getElementById('ocr-f-nif').value.trim();
-  const fornecedor_nome = document.getElementById('ocr-f-nome').value.trim();
-  const numero_fatura = document.getElementById('ocr-f-numero').value.trim();
-  const data_compra = document.getElementById('ocr-f-data').value.trim();
-  const taxa_iva = document.getElementById('ocr-f-iva').value.trim();
-  const categoria = document.getElementById('ocr-f-categoria').value.trim();
+  const fornecedor_nif = document.getElementById(`ocr-f-nif-${id}`).value.trim();
+  const fornecedor_nome = document.getElementById(`ocr-f-nome-${id}`).value.trim();
+  const numero_fatura = document.getElementById(`ocr-f-numero-${id}`).value.trim();
+  const data_compra = document.getElementById(`ocr-f-data-${id}`).value.trim();
+  const taxa_iva = document.getElementById(`ocr-f-iva-${id}`).value.trim();
+  const categoria = document.getElementById(`ocr-f-categoria-${id}`).value.trim();
 
-  const descs = Array.from(document.querySelectorAll('.ocr-item-desc'));
+  const descs = Array.from(document.querySelectorAll(`.ocr-item-desc-${id}`));
   const itens = descs.map(el => {
     const i = el.dataset.i;
-    const qtd = document.querySelector(`.ocr-item-qtd[data-i="${i}"]`).value;
-    const unit = document.querySelector(`.ocr-item-unit[data-i="${i}"]`).value;
-    const total = document.querySelector(`.ocr-item-total[data-i="${i}"]`).value;
+    const qtd = document.querySelector(`.ocr-item-qtd-${id}[data-i="${i}"]`).value;
+    const unit = document.querySelector(`.ocr-item-unit-${id}[data-i="${i}"]`).value;
+    const total = document.querySelector(`.ocr-item-total-${id}[data-i="${i}"]`).value;
     return {
       fornecedor_nif, fornecedor_nome, numero_fatura, data_compra,
       descricao: el.value.trim(), tipo: '',
@@ -871,23 +892,31 @@ async function confirmOcrSave(){
     };
   });
 
-  result.innerHTML = '<div class="loading">A gravar e a enviar ao contabilista…</div>';
+  resultado.innerHTML = '<div class="loading">A gravar e a enviar ao contabilista…</div>';
   try{
     const r = await apiCallPost({
       action: 'saveItemComprado',
       nif: session.nif,
       token: session.token,
       itens: JSON.stringify(itens),
-      image_base64: ocrFicheiroBase64,
-      mime_type: ocrFicheiroMimeType
+      image_base64: lote.base64,
+      mime_type: lote.mimeType,
+      forcar: forcar ? 'true' : 'false'
     });
+
+    if(!r.success && r.duplicado){
+      resultado.innerHTML = `
+        <div class="empty-state" style="color:var(--amber);">${r.error}</div>
+        <button class="btn-primary" style="background:var(--amber);" onclick="confirmOcrSave('${id}', true)">Gravar mesmo assim</button>
+      `;
+      return;
+    }
     if(!r.success) throw new Error(r.error || 'Erro desconhecido');
-    ocrFicheiroBase64 = null;
-    ocrFicheiroMimeType = null;
-    result.innerHTML = '<div class="empty-state">Fatura gravada com sucesso.</div>';
-    ocrExtraido = null;
+
+    delete ocrLotes[id];
+    document.getElementById('ocr-card-' + id).innerHTML = '<div class="empty-state">Fatura gravada com sucesso.</div>';
   }catch(err){
-    result.innerHTML = '<div class="empty-state">Erro ao gravar: ' + err.message + '</div>';
+    resultado.innerHTML = '<div class="empty-state">Erro ao gravar: ' + err.message + '</div>';
   }finally{
     ocrEmProgresso = false;
   }
