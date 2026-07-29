@@ -360,21 +360,25 @@ function deltaArrow(dir){
 function renderClientDashboard(data){
   const m = data.metrics || {};
   const fat = computeFaturacaoSummary(data.vendas);
-  const runwayMeses = estimateRunway(m, fat); // heurística simples, ver função abaixo
+  const custosInfo = computeCustosSummary(data.custos);
+  const margemInfo = computeMargemSummary(fat, custosInfo, m);
+  const impostoInfo = computeImpostoEstimado(fat, margemInfo, data.derrama_municipal);
+  const saldoInfo = computeSaldoEstimado(data.movimentos, m);
+  const runwayMeses = estimateRunway(m, fat, custosInfo, saldoInfo);
   const gauge = renderGauge(runwayMeses);
 
   const alerts = computeAlerts(data.deadlines, data.movimentos, runwayMeses);
 
   return `
     ${renderAlerts(alerts)}
-    ${renderKpiGridFixed(m, fat)}
+    ${renderKpiGridFixed(m, fat, margemInfo, impostoInfo, saldoInfo)}
     ${gauge}
     ${renderOcrUploader()}
     ${renderFiscalChat()}
     ${renderSection('Prazos fiscais', renderDeadlinesHeader(data) + renderDeadlines(data.deadlines))}
     ${renderSection('Movimentos recentes', renderMovimentos(data.movimentos))}
     ${renderSection('Vendas mensais', renderVendas(data.vendas))}
-    ${renderTaxEstimator(fat, m)}
+    ${renderTaxEstimator(fat, m, margemInfo, data.derrama_municipal)}
     ${renderSection('Comparação com o setor', renderBenchmark(data.benchmark))}
   `;
 }
@@ -415,9 +419,85 @@ function computeFaturacaoSummary(vendas){
   return { total, deltaLabel, dir, ultimoMes: ordenado.length ? Number(ordenado[ordenado.length-1].total_faturado)||0 : null };
 }
 
-// KPI grid corrigido (a versão acima tinha um placeholder — esta é a que efetivamente conta)
-function renderKpiGridFixed(m, fat){
+// Mesma lógica da faturação, mas para a tab CustosMensais (opcional — pode não existir ainda).
+function computeCustosSummary(custos){
+  if(!custos || !custos.length) return { total:null, ultimoMes:null };
+
+  const anoAtual = new Date().getFullYear();
+  const doAno = custos.filter(c => Number(c.ano) === anoAtual);
+  const base = doAno.length ? doAno : custos;
+  const total = base.reduce((s, c) => s + (Number(c.custos_totais) || 0), 0);
+
+  const ordenado = custos.slice().sort((a, b) => {
+    const chaveA = Number(a.ano) * 12 + (MESES_PT_FULL[String(a.mes).toLowerCase()] ?? 0);
+    const chaveB = Number(b.ano) * 12 + (MESES_PT_FULL[String(b.mes).toLowerCase()] ?? 0);
+    return chaveA - chaveB;
+  });
+
+  return { total, ultimoMes: ordenado.length ? Number(ordenado[ordenado.length-1].custos_totais)||0 : null };
+}
+
+// Margem automática = (faturação - custos) / faturação, só quando há dados reais de CustosMensais
+// para o mesmo período. Sem isso, cai para o valor manual que o CC já tinha na Metrics (compatível
+// com o que já existia antes desta automatização).
+function computeMargemSummary(fat, custosInfo, m){
+  if(fat.total === null || custosInfo.total === null || fat.total <= 0){
+    return {
+      pct: m.margem_delta !== undefined ? Number(m.margem_delta) : null,
+      dir: m.margem_dir || 'flat',
+      label: m.margem_delta_label || '',
+      auto: false
+    };
+  }
+  const pct = Math.round(((fat.total - custosInfo.total) / fat.total) * 1000) / 10;
+
+  let dir = 'flat', label = '';
+  if(fat.ultimoMes !== null && custosInfo.ultimoMes !== null && fat.ultimoMes > 0){
+    const margemUltimoMes = (fat.ultimoMes - custosInfo.ultimoMes) / fat.ultimoMes;
+    dir = margemUltimoMes >= (pct/100) ? 'up' : 'down';
+    label = 'com base em CustosMensais';
+  }
+
+  return { pct, dir, label, auto: true };
+}
+
+// Estimativa de IRC reaproveitada do mesmo cálculo da calculadora manual — ver renderTaxEstimator.
+// Só preenche automaticamente quando há faturação E margem calculadas; caso contrário cai para o
+// valor manual da Metrics (imposto_previsto), tal como antes.
+function computeImpostoEstimado(fat, margemInfo, derramaMunicipal){
+  if(fat.total === null || margemInfo.pct === null || fat.total <= 0){
+    return { total: null, auto: false };
+  }
+  const materiaEstimada = Math.max(0, fat.total * (margemInfo.pct / 100));
+  const derramaPct = Number(derramaMunicipal) || 0;
+  const r = computeIRC(materiaEstimada, true, derramaPct); // assume PME por defeito
+  return { total: r.total, auto: true };
+}
+
+// Saldo estimado a partir dos Movimentos concluídos (vendas somam, compras subtraem). NÃO é o
+// saldo bancário real — começa do zero e só reflete o que estiver registado na tab Movimentos.
+// Se não houver nenhum movimento concluído, cai para o valor manual da Metrics (saldo_atual).
+function computeSaldoEstimado(movimentos, m){
+  const concluidos = (movimentos || []).filter(mv => String(mv.estado || '').toLowerCase() === 'concluido');
+  if(!concluidos.length){
+    return { total: m.saldo_atual !== undefined ? Number(m.saldo_atual) : null, auto: false };
+  }
+  const total = concluidos.reduce((s, mv) => {
+    const valor = Number(mv.valor) || 0;
+    if(mv.tipo === 'venda') return s + valor;
+    if(mv.tipo === 'compra') return s - valor;
+    return s;
+  }, 0);
+  return { total, auto: true };
+}
+
+// KPI grid — usa valores automáticos quando existem, cai para manual (Metrics) caso contrário.
+function renderKpiGridFixed(m, fat, margemInfo, impostoInfo, saldoInfo){
   fat = fat || { total:null, deltaLabel:'', dir:'flat' };
+  margemInfo = margemInfo || { pct:null, dir:'flat', label:'', auto:false };
+  impostoInfo = impostoInfo || { total: m.imposto_previsto, auto:false };
+  saldoInfo = saldoInfo || { total: m.saldo_atual, auto:false };
+
   return `
     <div class="kpi-grid" style="margin-top:-20px;">
       <div class="kpi-card">
@@ -426,32 +506,37 @@ function renderKpiGridFixed(m, fat){
         <div class="kpi-delta ${deltaClass(fat.dir)}">${deltaArrow(fat.dir)}${fat.deltaLabel}</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-label">Margem</div>
-        <div class="kpi-value">${m.margem_delta !== undefined ? m.margem_delta + '%' : '—'}</div>
-        <div class="kpi-delta ${deltaClass(m.margem_dir)}">${deltaArrow(m.margem_dir)}${m.margem_delta_label || ''}</div>
+        <div class="kpi-label">Margem${margemInfo.auto ? ' (real)' : ''}</div>
+        <div class="kpi-value">${margemInfo.pct !== null ? margemInfo.pct + '%' : '—'}</div>
+        <div class="kpi-delta ${deltaClass(margemInfo.dir)}">${deltaArrow(margemInfo.dir)}${margemInfo.label}</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-label">Imposto previsto</div>
-        <div class="kpi-value">${fmtEUR(m.imposto_previsto)}</div>
+        <div class="kpi-label">Imposto previsto${impostoInfo.auto ? ' (estim.)' : ''}</div>
+        <div class="kpi-value">${impostoInfo.total !== null ? fmtEUR(Math.round(impostoInfo.total)) : '—'}</div>
       </div>
       <div class="kpi-card">
-        <div class="kpi-label">Saldo atual</div>
-        <div class="kpi-value">${fmtEUR(m.saldo_atual)}</div>
-        <div class="kpi-delta flat">${m.saldo_atual_data ? 'em ' + m.saldo_atual_data : ''}</div>
+        <div class="kpi-label">Saldo${saldoInfo.auto ? ' estimado (movimentos)' : ' atual'}</div>
+        <div class="kpi-value">${saldoInfo.total !== null && !isNaN(saldoInfo.total) ? fmtEUR(saldoInfo.total) : '—'}</div>
+        <div class="kpi-delta flat">${saldoInfo.auto ? 'não é o saldo bancário real' : (m.saldo_atual_data ? 'em ' + m.saldo_atual_data : '')}</div>
       </div>
     </div>
   `;
 }
 
-// Heurística simples para meses de fôlego: saldo_atual / (faturação real do último mês * 0.6 como proxy de custos).
-// Isto é um placeholder honesto: sem uma coluna explícita de "custos_mensais" na sheet, não dá para
-// calcular um runway rigoroso.
-// AVISO PARA O LUIS: substitui isto por um cálculo real assim que tiveres custos mensais na Metrics.
-function estimateRunway(m, fat){
-  const saldo = Number(m.saldo_atual);
-  const faturacao = fat && fat.ultimoMes !== null ? fat.ultimoMes : NaN;
-  if(isNaN(saldo) || isNaN(faturacao) || faturacao <= 0) return null;
-  const queimaEstimada = faturacao * 0.6;
+// Meses de fôlego: usa custos reais do último mês se existirem (CustosMensais); senão cai para a
+// heurística antiga (60% da faturação do último mês como proxy). Usa o saldo estimado se existir.
+function estimateRunway(m, fat, custosInfo, saldoInfo){
+  const saldo = saldoInfo && saldoInfo.total !== null ? Number(saldoInfo.total) : Number(m.saldo_atual);
+  if(isNaN(saldo)) return null;
+
+  let queimaEstimada;
+  if(custosInfo && custosInfo.ultimoMes !== null && custosInfo.ultimoMes > 0){
+    queimaEstimada = custosInfo.ultimoMes;
+  } else {
+    const faturacao = fat && fat.ultimoMes !== null ? fat.ultimoMes : NaN;
+    if(isNaN(faturacao) || faturacao <= 0) return null;
+    queimaEstimada = faturacao * 0.6;
+  }
   if(queimaEstimada <= 0) return null;
   return Math.round((saldo / queimaEstimada) * 10) / 10;
 }
@@ -934,11 +1019,26 @@ function renderBenchmark(b){
  * estimar sem dados de despesas detalhados; fica expressamente fora, para não dar um número falso
  * de confiança. Cálculo 100% no browser, sem chamar nenhuma API — não há custo nem risco de dados. */
 
-function renderTaxEstimator(fat, metrics){
-  const margemPct = Number(metrics.margem_delta);
+// Função pura, reaproveitada pela calculadora manual e pelo KPI "Imposto previsto" automático.
+function computeIRC(materia, isPme, derramaPct){
+  let irc;
+  if(isPme){
+    const primeiroEscalao = Math.min(materia, 50000);
+    const restante = Math.max(0, materia - 50000);
+    irc = primeiroEscalao * 0.15 + restante * 0.19;
+  } else {
+    irc = materia * 0.19;
+  }
+  const derrama = materia * ((Number(derramaPct) || 0) / 100);
+  return { irc, derrama, total: irc + derrama };
+}
+
+function renderTaxEstimator(fat, metrics, margemInfo, derramaMunicipal){
+  const margemPct = margemInfo && margemInfo.pct !== null ? margemInfo.pct : Number(metrics.margem_delta);
   const lucroEstimado = (fat && fat.total !== null && !isNaN(margemPct))
     ? Math.round(fat.total * (margemPct / 100))
     : '';
+  const derramaDefault = derramaMunicipal !== undefined && derramaMunicipal !== null ? derramaMunicipal : 0;
 
   return `
     <section class="block">
@@ -952,7 +1052,7 @@ function renderTaxEstimator(fat, metrics){
       </div>
       <div class="field">
         <label>Derrama municipal (%) — consulta a taxa do teu município</label>
-        <input id="irc-derrama" type="number" step="0.1" value="0" placeholder="Ex: 1.5">
+        <input id="irc-derrama" type="number" step="0.1" value="${derramaDefault}" placeholder="Ex: 1.5">
       </div>
       <div style="display:flex; align-items:center; gap:8px; margin-bottom:14px;">
         <input type="checkbox" id="irc-pme" checked style="width:16px; height:16px;">
@@ -975,17 +1075,7 @@ function calcularIRC(){
     return;
   }
 
-  let irc;
-  if(isPme){
-    const primeiroEscalao = Math.min(materia, 50000);
-    const restante = Math.max(0, materia - 50000);
-    irc = primeiroEscalao * 0.15 + restante * 0.19;
-  } else {
-    irc = materia * 0.19;
-  }
-
-  const derrama = materia * (derramaPct / 100);
-  const total = irc + derrama;
+  const r = computeIRC(materia, isPme, derramaPct);
 
   let avisoEstadual = '';
   if(materia > 1500000){
@@ -993,9 +1083,9 @@ function calcularIRC(){
   }
 
   resultado.innerHTML = `
-    <div class="list-item"><div class="li-main"><div class="li-title">IRC (${isPme ? '15%/19% PME' : '19%'})</div></div><div class="li-title">${fmtEUR(Math.round(irc))}</div></div>
-    <div class="list-item"><div class="li-main"><div class="li-title">Derrama municipal (${derramaPct}%)</div></div><div class="li-title">${fmtEUR(Math.round(derrama))}</div></div>
-    <div class="list-item" style="border-left:3px solid var(--accent);"><div class="li-main"><div class="li-title">Total estimado</div></div><div class="li-title">${fmtEUR(Math.round(total))}</div></div>
+    <div class="list-item"><div class="li-main"><div class="li-title">IRC (${isPme ? '15%/19% PME' : '19%'})</div></div><div class="li-title">${fmtEUR(Math.round(r.irc))}</div></div>
+    <div class="list-item"><div class="li-main"><div class="li-title">Derrama municipal (${derramaPct}%)</div></div><div class="li-title">${fmtEUR(Math.round(r.derrama))}</div></div>
+    <div class="list-item" style="border-left:3px solid var(--accent);"><div class="li-main"><div class="li-title">Total estimado</div></div><div class="li-title">${fmtEUR(Math.round(r.total))}</div></div>
     ${avisoEstadual}
   `;
 }
@@ -1036,12 +1126,16 @@ async function loadAdminDetail(nif){
     if(!r.success){ c.innerHTML = '<div class="empty-state">'+ (r.error||'Erro.') +'</div>'; return; }
     document.getElementById('topbar-company').textContent = r.empresa || nif;
     const fat = computeFaturacaoSummary(r.vendas);
-    const runwayMeses = estimateRunway(r.metrics || {}, fat);
+    const custosInfo = computeCustosSummary(r.custos);
+    const margemInfo = computeMargemSummary(fat, custosInfo, r.metrics || {});
+    const impostoInfo = computeImpostoEstimado(fat, margemInfo, r.derrama_municipal);
+    const saldoInfo = computeSaldoEstimado(r.movimentos, r.metrics || {});
+    const runwayMeses = estimateRunway(r.metrics || {}, fat, custosInfo, saldoInfo);
     const alerts = computeAlerts(r.deadlines, r.movimentos, runwayMeses);
     c.innerHTML = `
       <button class="back-btn" onclick="loadAdminList()">← Todos os clientes</button>
       ${renderAlerts(alerts)}
-      ${renderKpiGridFixed(r.metrics || {}, fat)}
+      ${renderKpiGridFixed(r.metrics || {}, fat, margemInfo, impostoInfo, saldoInfo)}
       ${renderSaftImporter(nif)}
       ${renderDeadlinesHeader(r)}
       ${renderSection('Prazos fiscais', renderDeadlinesAdmin(r.deadlines, nif))}
