@@ -826,43 +826,17 @@ async function handleOcrFile(){
 }
 
 function renderOcrReviewForm(dados, id, nomeFicheiro){
-  const itens = (dados.itens && dados.itens.length) ? dados.itens : [{
-    descricao: dados.categoria || 'Compra',
-    quantidade: 1,
-    valor_unitario: dados.valor_total || 0,
-    valor_total: dados.valor_total || 0
-  }];
-
-  const camposComuns = `
-    <div class="li-sub" style="margin-bottom:4px; font-weight:600;">${nomeFicheiro || ''}</div>
-    <div class="li-sub" style="margin-bottom:8px; color:var(--amber);">Confirma ou corrige os dados antes de gravar — a leitura automática pode errar, sobretudo em números.</div>
-    <div class="field"><label>NIF do fornecedor</label><input id="ocr-f-nif-${id}" value="${dados.fornecedor_nif || ''}"></div>
-    <div class="field"><label>Nome do fornecedor</label><input id="ocr-f-nome-${id}" value="${dados.fornecedor_nome || ''}"></div>
-    <div class="field"><label>Nº da fatura</label><input id="ocr-f-numero-${id}" value="${dados.numero_fatura || ''}"></div>
-    <div class="field"><label>Data da compra (AAAA-MM-DD)</label><input id="ocr-f-data-${id}" value="${dados.data_compra || ''}"></div>
-    <div class="field"><label>Taxa de IVA (%)</label><input id="ocr-f-iva-${id}" value="${dados.taxa_iva ?? ''}" inputmode="decimal"></div>
-    <div class="field"><label>Categoria</label><input id="ocr-f-categoria-${id}" value="${dados.categoria || ''}"></div>
-  `;
-
-  const linhasItens = itens.map((it, i) => `
-    <div class="list-item" style="flex-direction:column; align-items:stretch; gap:6px;">
-      <div style="display:flex; gap:8px; align-items:center;">
-        <input class="ocr-item-desc-${id}" data-i="${i}" value="${(it.descricao||'').replace(/"/g,'&quot;')}" placeholder="Descrição" style="flex:1;">
-        <button type="button" onclick="this.closest('.list-item').remove()" title="Não considerar este item" style="background:none; border:1px solid var(--line); color:var(--rust); border-radius:8px; width:32px; height:32px; flex-shrink:0; cursor:pointer; font-size:16px; line-height:1;">×</button>
-      </div>
-      <div style="display:flex; gap:8px;">
-        <input class="ocr-item-qtd-${id}" data-i="${i}" value="${it.quantidade ?? 1}" placeholder="Qtd" style="width:70px; padding:8px; background:var(--ink); border:1px solid var(--line); border-radius:8px; color:var(--text); font-family:var(--font-mono);">
-        <input class="ocr-item-unit-${id}" data-i="${i}" value="${it.valor_unitario ?? ''}" placeholder="Valor unit." style="flex:1; padding:8px; background:var(--ink); border:1px solid var(--line); border-radius:8px; color:var(--text); font-family:var(--font-mono);">
-        <input class="ocr-item-total-${id}" data-i="${i}" value="${it.valor_total ?? ''}" placeholder="Total" style="flex:1; padding:8px; background:var(--ink); border:1px solid var(--line); border-radius:8px; color:var(--text); font-family:var(--font-mono);">
-      </div>
-    </div>
-  `).join('');
-
   return `
     <section class="block" id="ocr-card-${id}" style="border-top:1px solid var(--line); padding-top:16px;">
-      ${camposComuns}
-      <div class="block-title" style="font-size:14px; margin-top:16px;">Itens</div>
-      ${linhasItens}
+      <div class="li-sub" style="margin-bottom:4px; font-weight:600;">${nomeFicheiro || ''}</div>
+      <div class="li-sub" style="margin-bottom:8px; color:var(--amber);">Confirma ou corrige os dados antes de gravar — a leitura automática pode errar, sobretudo em números.</div>
+      <div class="field"><label>NIF do fornecedor</label><input id="ocr-f-nif-${id}" value="${dados.fornecedor_nif || ''}"></div>
+      <div class="field"><label>Nome do fornecedor</label><input id="ocr-f-nome-${id}" value="${dados.fornecedor_nome || ''}"></div>
+      <div class="field"><label>Nº da fatura</label><input id="ocr-f-numero-${id}" value="${dados.numero_fatura || ''}"></div>
+      <div class="field"><label>Data da compra (AAAA-MM-DD)</label><input id="ocr-f-data-${id}" value="${dados.data_compra || ''}"></div>
+      <div class="field"><label>Valor total (€)</label><input id="ocr-f-valor-${id}" type="number" step="0.01" value="${dados.valor_total ?? ''}"></div>
+      <div class="field"><label>Taxa de IVA (%)</label><input id="ocr-f-iva-${id}" value="${dados.taxa_iva ?? ''}" inputmode="decimal"></div>
+      <div class="field"><label>Categoria</label><input id="ocr-f-categoria-${id}" value="${dados.categoria || ''}"></div>
       <button class="btn-primary" onclick="confirmOcrSave('${id}')">Guardar fatura</button>
       <div id="ocr-resultado-${id}"></div>
     </section>
@@ -874,32 +848,29 @@ async function confirmOcrSave(id, forcar){
   if(!lote || ocrEmProgresso) return;
   const resultado = document.getElementById('ocr-resultado-' + id);
 
-  const descs = Array.from(document.querySelectorAll(`.ocr-item-desc-${id}`));
-  if(!descs.length){
-    resultado.innerHTML = '<div class="empty-state">Removeste todos os itens — não há nada para gravar. Volta a ler o ficheiro se foi engano.</div>';
-    return;
-  }
-
   ocrEmProgresso = true;
   const fornecedor_nif = document.getElementById(`ocr-f-nif-${id}`).value.trim();
   const fornecedor_nome = document.getElementById(`ocr-f-nome-${id}`).value.trim();
   const numero_fatura = document.getElementById(`ocr-f-numero-${id}`).value.trim();
   const data_compra = document.getElementById(`ocr-f-data-${id}`).value.trim();
+  const valor_total = document.getElementById(`ocr-f-valor-${id}`).value.trim();
   const taxa_iva = document.getElementById(`ocr-f-iva-${id}`).value.trim();
   const categoria = document.getElementById(`ocr-f-categoria-${id}`).value.trim();
 
-  const itens = descs.map(el => {
-    const i = el.dataset.i;
-    const qtd = document.querySelector(`.ocr-item-qtd-${id}[data-i="${i}"]`).value;
-    const unit = document.querySelector(`.ocr-item-unit-${id}[data-i="${i}"]`).value;
-    const total = document.querySelector(`.ocr-item-total-${id}[data-i="${i}"]`).value;
-    return {
-      fornecedor_nif, fornecedor_nome, numero_fatura, data_compra,
-      descricao: el.value.trim(), tipo: '',
-      quantidade: qtd, valor_unitario: unit, valor_total: total,
-      taxa_iva, categoria
-    };
-  });
+  if(!valor_total){
+    resultado.innerHTML = '<div class="empty-state">Indica o valor total da fatura.</div>';
+    ocrEmProgresso = false;
+    return;
+  }
+
+  // Uma única linha por fatura (deixámos de guardar artigos/linhas individuais, de propósito,
+  // para não sobrecarregar a sheet).
+  const itens = [{
+    fornecedor_nif, fornecedor_nome, numero_fatura, data_compra,
+    descricao: categoria || fornecedor_nome || 'Compra', tipo: '',
+    quantidade: 1, valor_unitario: valor_total, valor_total,
+    taxa_iva, categoria
+  }];
 
   resultado.innerHTML = '<div class="loading">A gravar e a enviar ao contabilista…</div>';
   try{
